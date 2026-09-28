@@ -202,6 +202,9 @@ public class DxgiScreenCapture : IScreenCapture
                     if (!Initialize(_targetFps, _scalePercent))
                     {
                         LogThrottled("[DXGI] Re-initialization failed, retrying...");
+                        // Keep viewers on the last known frame instead of starving them
+                        // (e.g. while Windows holds the secure desktop for a UAC prompt).
+                        EmitLastFrame();
                         Thread.Sleep(100);
                         continue;
                     }
@@ -233,6 +236,7 @@ public class DxgiScreenCapture : IScreenCapture
                     // reset, INVALID_CALL, ...) previously fell through here silently,
                     // stalling capture forever with no trace in the log. Recreate.
                     LogThrottled($"[DXGI] AcquireNextFrame failed (0x{res.Code:X8}), reinitializing capture...");
+                    EmitLastFrame();
                     DisposeResources();
                     Thread.Sleep(50);
                 }
@@ -242,6 +246,7 @@ public class DxgiScreenCapture : IScreenCapture
                 // GPU device removal (driver reset/TDR) surfaces here. Previously this
                 // was Debug-only and the loop spun forever producing nothing.
                 LogThrottled($"[DXGI] Capture loop exception: {ex.Message} — reinitializing capture...");
+                EmitLastFrame();
                 DisposeResources();
                 Thread.Sleep(50);
             }
