@@ -1,0 +1,17 @@
+# Build outputs
+bin/
+obj/
+publish/
+
+# IDE / Visual Studio
+.vs/
+*.user
+*.suo
+
+# Logs and crash dumps
+*.dmp
+*.log
+
+# OS junk
+Thumbs.db
+Desktop.ini
