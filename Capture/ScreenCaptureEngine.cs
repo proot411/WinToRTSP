@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using WinToRTSP.Services;
 
 namespace WinToRTSP.Capture;
 
@@ -32,6 +33,7 @@ public class ScreenCaptureEngine : IDisposable
 
         dxgi.Dispose();
         Debug.WriteLine("[CAPTURE] DXGI Desktop Duplication failed, falling back to GDI capture...");
+        AppLog.Write("[CAPTURE] DXGI Desktop Duplication init failed — falling back to GDI BitBlt.");
 
         // 2. Fallback to GDI BitBlt capture
         var gdi = new GdiScreenCapture();
@@ -46,6 +48,7 @@ public class ScreenCaptureEngine : IDisposable
 
         gdi.Dispose();
         Debug.WriteLine("[CAPTURE] GDI capture also failed. Falling back to WinForms Screen.CopyFromScreen (VM-compatible)...");
+        AppLog.Write("[CAPTURE] GDI BitBlt init failed — falling back to WinForms CopyFromScreen.");
 
         // 3. Last resort: WinForms Screen.CopyFromScreen (works in VMs, Hyper-V, VMware, VirtualBox)
         var winForms = new WinFormsScreenCapture();
@@ -60,6 +63,7 @@ public class ScreenCaptureEngine : IDisposable
 
         winForms.Dispose();
         Debug.WriteLine("[CAPTURE] All capture methods failed (DXGI, GDI, WinForms).");
+        AppLog.Write("[CAPTURE] All capture methods failed (DXGI, GDI, WinForms).");
         return false;
     }
 

@@ -6,6 +6,7 @@ using System.Threading;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
+using WinToRTSP.Services;
 
 namespace WinToRTSP.Capture;
 
@@ -28,6 +29,18 @@ public class DxgiScreenCapture : IScreenCapture
     private int _screenHeight;
     private int _scaledWidth;
     private int _scaledHeight;
+
+    // Non-pooled copy of the most recent frame, re-emitted while the desktop is
+    // static so viewers never starve (players treat prolonged silence as a dead
+    // stream and turn black). Only touched on the capture thread.
+    private byte[]? _lastFrameData;
+    private int _lastFrameLength;
+    private int _lastFrameWidth;
+    private int _lastFrameHeight;
+    private int _lastFrameStride;
+    private bool _hasLastFrame;
+
+    private long _lastErrorLogTicks;
 
     public bool IsRunning => _isRunning;
     public int OutputWidth => _scaledWidth;
@@ -134,6 +147,7 @@ public class DxgiScreenCapture : IScreenCapture
         catch (Exception ex)
         {
             Debug.WriteLine($"DXGI initialization failed: {ex.Message}");
+            LogThrottled($"[DXGI] Initialization failed: {ex.Message}");
             DisposeResources();
             return false;
         }
@@ -178,6 +192,7 @@ public class DxgiScreenCapture : IScreenCapture
         while (!token.IsCancellationRequested && _isRunning)
         {
             stopwatch.Restart();
+            bool frameAcquired = false;
 
             try
             {
@@ -186,6 +201,7 @@ public class DxgiScreenCapture : IScreenCapture
                     // Re-initialize if lost
                     if (!Initialize(_targetFps, _scalePercent))
                     {
+                        LogThrottled("[DXGI] Re-initialization failed, retrying...");
                         Thread.Sleep(100);
                         continue;
                     }
@@ -194,6 +210,7 @@ public class DxgiScreenCapture : IScreenCapture
                 var res = _duplication!.AcquireNextFrame(100, out _, out var desktopResource);
                 if (res.Success && desktopResource != null)
                 {
+                    frameAcquired = true;
                     using (desktopResource)
                     {
                         using var desktopTexture = desktopResource.QueryInterface<ID3D11Texture2D>();
@@ -203,24 +220,39 @@ public class DxgiScreenCapture : IScreenCapture
                             ProcessStagingTexture();
                         }
                     }
-                    _duplication.ReleaseFrame();
                 }
                 else if (res.Code == Vortice.DXGI.ResultCode.WaitTimeout.Code)
                 {
-                    // Timeout is expected when screen doesn't change
+                    // Desktop hasn't changed (idle screen). Repeat the last frame so
+                    // the stream keeps flowing; without this, viewers starve and go black.
+                    EmitLastFrame();
                 }
-                else if (res.Code == Vortice.DXGI.ResultCode.AccessLost.Code || res.Code == Vortice.DXGI.ResultCode.AccessDenied.Code)
+                else
                 {
-                    Debug.WriteLine("[DXGI] Desktop duplication access lost, re-initializing...");
+                    // Anything else (ACCESS_LOST, DEVICE_REMOVED after a GPU driver
+                    // reset, INVALID_CALL, ...) previously fell through here silently,
+                    // stalling capture forever with no trace in the log. Recreate.
+                    LogThrottled($"[DXGI] AcquireNextFrame failed (0x{res.Code:X8}), reinitializing capture...");
                     DisposeResources();
                     Thread.Sleep(50);
-                    Initialize(_targetFps, _scalePercent);
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[DXGI] Exception in capture loop: {ex.Message}");
+                // GPU device removal (driver reset/TDR) surfaces here. Previously this
+                // was Debug-only and the loop spun forever producing nothing.
+                LogThrottled($"[DXGI] Capture loop exception: {ex.Message} — reinitializing capture...");
+                DisposeResources();
                 Thread.Sleep(50);
+            }
+            finally
+            {
+                // A successfully acquired frame MUST be released even when processing
+                // throws — otherwise every later AcquireNextFrame fails forever.
+                if (frameAcquired)
+                {
+                    try { _duplication?.ReleaseFrame(); } catch { /* device already gone */ }
+                }
             }
 
             // High precision frame pacing
@@ -279,6 +311,20 @@ public class DxgiScreenCapture : IScreenCapture
                 }
             }
 
+            // Keep a non-pooled copy for idle-time frame repetition (see EmitLastFrame).
+            // MUST happen before FrameCaptured: the handler disposes the frame, which
+            // returns the pooled buffer to the ArrayPool.
+            if (_lastFrameData == null || _lastFrameData.Length != totalBytes)
+            {
+                _lastFrameData = new byte[totalBytes];
+            }
+            Buffer.BlockCopy(buffer, 0, _lastFrameData, 0, totalBytes);
+            _lastFrameLength = totalBytes;
+            _lastFrameWidth = dstWidth;
+            _lastFrameHeight = dstHeight;
+            _lastFrameStride = dstStride;
+            _hasLastFrame = true;
+
             var frame = new CapturedFrame(buffer, totalBytes, dstWidth, dstHeight, dstStride, Stopwatch.GetTimestamp());
             FrameCaptured?.Invoke(frame);
         }
@@ -286,6 +332,38 @@ public class DxgiScreenCapture : IScreenCapture
         {
             _context.Unmap(_stagingTexture, 0);
         }
+    }
+
+    /// <summary>
+    /// Re-emits the most recent frame while the desktop is static. Uses a non-pooled
+    /// cached buffer (fromPool: false) because handlers dispose the frame, which would
+    /// otherwise return the buffer to the shared ArrayPool while we still reuse it.
+    /// </summary>
+    private void EmitLastFrame()
+    {
+        if (!_hasLastFrame || _lastFrameData == null) return;
+
+        try
+        {
+            var frame = new CapturedFrame(
+                _lastFrameData, _lastFrameLength, _lastFrameWidth, _lastFrameHeight,
+                _lastFrameStride, Stopwatch.GetTimestamp(), fromPool: false);
+            FrameCaptured?.Invoke(frame);
+            frame.Dispose();
+        }
+        catch (Exception ex)
+        {
+            LogThrottled($"[DXGI] Failed to repeat last frame: {ex.Message}");
+        }
+    }
+
+    /// <summary>Logs to the persistent app log at most once every 5 seconds.</summary>
+    private void LogThrottled(string message)
+    {
+        long now = Stopwatch.GetTimestamp();
+        if (now - _lastErrorLogTicks < Stopwatch.Frequency * 5) return;
+        _lastErrorLogTicks = now;
+        AppLog.Write(message);
     }
 
     private static unsafe void ScaleBilinear(

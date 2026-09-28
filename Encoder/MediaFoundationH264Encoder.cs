@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using WinToRTSP.Capture;
+using WinToRTSP.Services;
 
 namespace WinToRTSP.Encoder;
 
@@ -24,6 +25,10 @@ public class MediaFoundationH264Encoder : IVideoEncoder
     private bool _mfStarted;
     private long _frameIndex;
     private IMFTransform? _mft;
+
+    private int _consecutiveInputRejections;
+    private long _lastEncoderErrorLogTicks;
+    private long _lastRecoveryTicks;
 
     /// <summary>Human readable reason for the last failed Initialize() call.</summary>
     public string? LastError { get; private set; }
@@ -415,13 +420,30 @@ public class MediaFoundationH264Encoder : IVideoEncoder
 
             if (hr == 0)
             {
+                _consecutiveInputRejections = 0;
                 _frameIndex++;
                 DrainOutput();
+            }
+            else
+            {
+                // A persistently rejecting MFT (typically MF_E_NOTACCEPTING after the
+                // output side wedged) used to drop every frame silently → black stream.
+                _consecutiveInputRejections++;
+                EncoderErrorThrottled($"[MF] ProcessInput rejected frame (0x{hr:X8}), consecutive: {_consecutiveInputRejections}");
+                if (_consecutiveInputRejections >= 5)
+                {
+                    _consecutiveInputRejections = 0;
+                    TryRecover($"ProcessInput kept rejecting frames (0x{hr:X8})");
+                }
             }
         }
         catch (Exception ex)
         {
+            // Previously Debug-only: a dead MFT (GPU driver reset) blacked out the
+            // stream forever without a single line in the app log.
             Debug.WriteLine($"[MF] Error encoding frame: {ex.Message}");
+            EncoderErrorThrottled($"[MF] EncodeFrame exception: {ex.Message}");
+            TryRecover($"EncodeFrame exception: {ex.Message}");
         }
         finally
         {
@@ -530,6 +552,44 @@ public class MediaFoundationH264Encoder : IVideoEncoder
         }
 
         PacketEncoded?.Invoke(new EncodedPacket(encodedData, encodedData.Length, isKeyFrame, timestampUs));
+    }
+
+    /// <summary>Logs encoder errors to the persistent app log (at most once / 5 s).</summary>
+    private void EncoderErrorThrottled(string message)
+    {
+        long now = Stopwatch.GetTimestamp();
+        if (now - _lastEncoderErrorLogTicks < Stopwatch.Frequency * 5) return;
+        _lastEncoderErrorLogTicks = now;
+        AppLog.Write(message);
+    }
+
+    /// <summary>
+    /// Rebuilds the encoder MFT after a failure. A wedged MFT (device removal, GPU
+    /// driver reset) never recovers on its own — Initialize() releases and recreates it.
+    /// Rate-limited so a persistent failure cannot turn into an init loop.
+    /// </summary>
+    private bool TryRecover(string reason)
+    {
+        long now = Stopwatch.GetTimestamp();
+        if (now - _lastRecoveryTicks < Stopwatch.Frequency * 10) return false;
+        _lastRecoveryTicks = now;
+
+        try
+        {
+            AppLog.Write($"[MF] Encoder failing ({reason}) — reinitializing encoder...");
+            long keepFrameIndex = _frameIndex;
+            bool ok = Initialize(_width, _height, _fps, _bitrateKbps);
+            _frameIndex = keepFrameIndex; // keep sample times (and RTP timestamps) monotonic for connected clients
+            AppLog.Write(ok
+                ? "[MF] Encoder reinitialized successfully."
+                : $"[MF] Encoder reinitialization FAILED: {LastError}");
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write($"[MF] Encoder reinitialization exception: {ex.Message}");
+            return false;
+        }
     }
 
     private static unsafe void BgraToNv12(byte* bgra, int width, int height, int stride, byte* nv12, int dstW, int dstH)
