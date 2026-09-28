@@ -313,6 +313,21 @@ Open a browser on any device on the same network:
 http://<host-ip>:8080
 ```
 
+### Allowing LAN Access (Windows Firewall)
+
+Windows Firewall **blocks unsolicited inbound connections by default**, so players on your LAN will not reach the app until the two ports are allowed. Typical symptoms: VLC on another machine times out or never shows a picture, and `nmap` reports the ports as *filtered* — while overlay VPNs (Tailscale, NetBird, …) still work, because their traffic rides outbound-initiated connections that the stateful firewall already permits.
+
+Run the following in an **elevated** PowerShell on the streaming PC (adjust the RTSP port to match `RtspPort` in `config.json`):
+
+```powershell
+New-NetFirewallRule -DisplayName "WinToRTSP RTSP (LAN)" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8554 -Profile Private
+New-NetFirewallRule -DisplayName "WinToRTSP Web UI (LAN)" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8080 -Profile Private
+```
+
+- Use `-Profile Private` only — this keeps the ports closed on public networks, in line with the [network security warning](#network-security-warning-do-not-expose-to-wan).
+- Verify your network profile is **Private** (`Get-NetConnectionProfile`); home LANs usually already are.
+- Optional, so `ping`/plain `nmap` (without `-Pn`) can find the host: `New-NetFirewallRule -DisplayName "WinToRTSP ICMP echo (LAN)" -Direction Inbound -Action Allow -Protocol ICMPv4 -IcmpType 8 -Profile Private`
+
 ---
 
 ## Security Model
